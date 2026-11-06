@@ -115,7 +115,11 @@ alert("Por favor seleccione la Categoría")
   }
 
     
-  const isButtonDisabled  = !inputValue1 ||  !inputValue2 || !inputValueD  || !inputValue3  ;
+  const isButtonDisabled =
+    inputValue1.trim().length < 5 ||
+    inputValue2.trim().length < 2 ||
+    inputValueD.trim().length < 2 ||
+    !inputValue3;
 
 return (
     <div className="App">
