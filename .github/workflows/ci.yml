@@ -1,115 +1,169 @@
-  
-name: React CI/CD Pipeline with software testing
 
-# This triggers the workflow on pushes and pull requests to the main branch
+name: React CI/CD Pipeline with software testing and DevSecOps
+
 on:
   push:
     branches:
       - main
+      - devsecops
   pull_request:
     branches:
       - main
 
-jobs:
-  build:
-    name: Build
-    runs-on: ubuntu-latest  # This specifies the OS for the job
+permissions:
+  contents: read
 
+jobs:
+  dependency-audit:
+    name: Audit npm dependencies
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2  # Checks out the code from your repository
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v2  # Sets up the Node.js environment
+        uses: actions/setup-node@v7
         with:
-          node-version: '16'  # Specifies the version of Node.js
+          node-version: '24'
+          cache: npm
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+  secret-scan:
+    name: Scan for secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code and full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          release_url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl --fail --silent --show-error --location "$release_url/$archive" --output "$RUNNER_TEMP/$archive"
+          curl --fail --silent --show-error --location "$release_url/gitleaks_${GITLEAKS_VERSION}_checksums.txt" --output "$RUNNER_TEMP/checksums.txt"
+          cd "$RUNNER_TEMP"
+          grep -F "  $archive" checksums.txt | sha256sum --check
+          tar -xzf "$archive" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan repository history for secrets
+        run: gitleaks git --redact --exit-code 1 .
+
+  build:
+    name: Build
+    needs: [dependency-audit, secret-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
 
       - name: Install dependencies
-        run: npm install  # Installs the required dependencies
+        run: npm ci
 
       - name: Build the app
-        run: npm run build  # Builds the React app for production
+        run: npm run build
 
   tests:
     name: Run Tests
     needs: build
     runs-on: ubuntu-latest
-
+    env:
+      CI: 'true'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
-        
-      - name: Use Node.js 18.x to run Test
-        uses: actions/setup-node@v3
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
         with:
-          node-version: 18.x
-          cache: 'npm'
-          
-      - name: Install Dependencies
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
         run: npm ci
-        
-      - name: Run Tests
+
+      - name: Run unit tests
         run: npm run test
 
-      #- name: Build the app
-      #  run: npm run build  # Builds the React app for production
-  # Job to deploy the application after build
   deploy:
     name: Deploy
+    needs: [tests, dependency-audit, secret-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    needs: tests  # Ensures the deploy job runs only after the build job completes successfully
-
     outputs:
-      vercel_url: ${{ steps.deploy-vercel.outputs.DEPLOY_URL }}
+      vercel_url: ${{ steps.deploy-vercel.outputs.vercel_url }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4 #  Re-checks out the code for deployment
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
 
       - name: Deploy to Vercel
         id: deploy-vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        # 💡 Usamos --confirm y limpiamos la salida para extraer SOLO la URL limpia
         run: |
-          URL=$(npx vercel --prod --yes --token $VERCEL_TOKEN | tail -n 1)
-          echo "DEPLOY_URL=$URL" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "Error: falta el secreto VERCEL_TOKEN"
+            exit 1
+          fi
+          URL="$(npx --yes vercel@latest deploy --prod --yes --token "$VERCEL_TOKEN")"
+          if [[ "$URL" != https://* ]]; then
+            echo "Error: Vercel no devolvió una URL válida: $URL"
+            exit 1
+          fi
+          echo "vercel_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Deployment: $URL"
 
   cypress-e2e:
     name: Cypress E2E Tests
-    runs-on: ubuntu-latest
     needs: deploy
-
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Cypress repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          repository: 'domenico-chang/cypress15c'
-          token: ${{ secrets.MI_GITHUB_TOKEN_REPOS }}
+          repository: domenico-chang/cypress15c
+          token: ${{ secrets.MI_GITHUB_TOKEN_REPOS || github.token }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 18.x
+          node-version: '24'
 
-      - name: Force Install Cypress Module
-        run: npm install cypress --save-dev
+      - name: Install Cypress dependencies
+        run: npm install --no-audit --no-fund
 
-      - name: Debug URL
-        run: echo "La URL recibida de Vercel es ${{ needs.deploy.outputs.vercel_url }}"
-          
+      - name: Debug deployment URL
+        env:
+          APP_URL: ${{ needs.deploy.outputs.vercel_url }}
+        run: echo "La URL recibida de Vercel es $APP_URL"
+
       - name: Run Cypress Tests
-        uses: cypress-io/github-action@v6
+        uses: cypress-io/github-action@v7
         env:
           CYPRESS_BASE_URL: ${{ needs.deploy.outputs.vercel_url }}
-          CYPRESS_SCREENSHOT_ON_RUN_FAILURE: false
-          CYPRESS_VIDEO: false
-          # 💡 Evita problemas de renderizado de fuentes/gráficas virtuales en Linux sin GUI
-          ELECTRON_DISABLE_GPU: 1
-          DISABLE_X1IR_WORKAROUNDS: true
+          CYPRESS_SCREENSHOT_ON_RUN_FAILURE: 'true'
+          CYPRESS_VIDEO: 'false'
         with:
           install: false
-          component: false
+          browser: chrome
           record: false
           publish-summary: true
-          # 💡 Forzamos el uso de Chrome en lugar de Electron, ya que gestiona mejor la memoria en GitHub Actions
-          browser: chrome 
