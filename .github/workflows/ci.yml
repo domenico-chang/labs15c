@@ -1,7 +1,5 @@
-  
 name: React CI/CD Pipeline with software testing and DevSecOps
 
-# This triggers the workflow on pushes and pull requests to the main branch
 on:
   push:
     branches:
@@ -17,16 +15,18 @@ jobs:
   dependency-audit:
     name: Audit npm dependencies
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: '24'
           cache: npm
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Audit dependencies
         run: npm audit --audit-level=high
@@ -34,10 +34,9 @@ jobs:
   secret-scan:
     name: Scan for secrets
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout code and full history
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -60,104 +59,111 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest  # This specifies the OS for the job
-
+    needs: [dependency-audit, secret-scan]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2  # Checks out the code from your repository
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v2  # Sets up the Node.js environment
+        uses: actions/setup-node@v7
         with:
-          node-version: '16'  # Specifies the version of Node.js
+          node-version: '24'
+          cache: npm
 
       - name: Install dependencies
-        run: npm install  # Installs the required dependencies
+        run: npm ci
 
       - name: Build the app
-        run: npm run build  # Builds the React app for production
+        run: npm run build
 
   tests:
-    name: Run Tests
+    name: Run unit tests
     needs: build
     runs-on: ubuntu-latest
-
+    env:
+      CI: 'true'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
-        
-      - name: Use Node.js 18.x to run Test
-        uses: actions/setup-node@v3
-        with:
-          node-version: 18.x
-          cache: 'npm'
-          
-      - name: Install Dependencies
-        run: npm ci
-        
-      - name: Run Tests
-        run: npm run test
+        uses: actions/checkout@v7
 
-      #- name: Build the app
-      #  run: npm run build  # Builds the React app for production
-  # Job to deploy the application after build
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
   deploy:
     name: Deploy
-    runs-on: ubuntu-latest
     needs: [tests, dependency-audit, secret-scan]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
     outputs:
-      vercel_url: ${{ steps.deploy-vercel.outputs.DEPLOY_URL }}
+      vercel_url: ${{ steps.deploy-vercel.outputs.vercel_url }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4 #  Re-checks out the code for deployment
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
 
       - name: Deploy to Vercel
         id: deploy-vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        # 💡 Usamos --confirm y limpiamos la salida para extraer SOLO la URL limpia
         run: |
-          URL=$(npx vercel --prod --yes --token $VERCEL_TOKEN | tail -n 1)
-          echo "DEPLOY_URL=$URL" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "Error: falta el secreto VERCEL_TOKEN"
+            exit 1
+          fi
+          URL="$(npx --yes vercel@latest deploy --prod --yes --token "$VERCEL_TOKEN" | tail -n 1)"
+          if [[ "$URL" != https://* ]]; then
+            echo "Error: Vercel no devolvió una URL válida: $URL"
+            exit 1
+          fi
+          echo "vercel_url=$URL" >> "$GITHUB_OUTPUT"
 
   cypress-e2e:
     name: Cypress E2E Tests
-    runs-on: ubuntu-latest
     needs: deploy
-
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Cypress repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          repository: 'domenico-chang/cypress15c'
-          token: ${{ secrets.MI_GITHUB_TOKEN_REPOS }}
+          repository: domenico-chang/cypress15c
+          token: ${{ secrets.MI_GITHUB_TOKEN_REPOS || github.token }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 18.x
+          node-version: '24'
 
-      - name: Force Install Cypress Module
+      - name: Install Cypress dependencies
         run: npm install cypress --save-dev
 
-      - name: Debug URL
-        run: echo "La URL recibida de Vercel es ${{ needs.deploy.outputs.vercel_url }}"
-          
+      - name: Debug deployment URL
+        env:
+          APP_URL: ${{ needs.deploy.outputs.vercel_url }}
+        run: echo "La URL recibida de Vercel es $APP_URL"
+
       - name: Run Cypress Tests
-        uses: cypress-io/github-action@v6
+        uses: cypress-io/github-action@v7
         env:
           CYPRESS_BASE_URL: ${{ needs.deploy.outputs.vercel_url }}
-          CYPRESS_SCREENSHOT_ON_RUN_FAILURE: false
-          CYPRESS_VIDEO: false
-          # 💡 Evita problemas de renderizado de fuentes/gráficas virtuales en Linux sin GUI
-          ELECTRON_DISABLE_GPU: 1
-          DISABLE_X1IR_WORKAROUNDS: true
+          CYPRESS_SCREENSHOT_ON_RUN_FAILURE: 'true'
+          CYPRESS_VIDEO: 'false'
         with:
           install: false
-          component: false
+          browser: chrome
           record: false
           publish-summary: true
-          # 💡 Forzamos el uso de Chrome en lugar de Electron, ya que gestiona mejor la memoria en GitHub Actions
-          browser: chrome 
