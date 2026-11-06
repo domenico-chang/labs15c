@@ -57,9 +57,76 @@ jobs:
       - name: Scan repository history for secrets
         run: gitleaks git --redact --exit-code 1 .
 
+  codeql-sast:
+    name: SAST - CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+          build-mode: none
+
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@v4
+
+  generate-sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate and validate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          npm sbom --sbom-format=cyclonedx > sbom.cdx.json
+          node --input-type=module <<'NODE'
+          import { readFileSync, statSync } from 'node:fs';
+
+          const path = 'sbom.cdx.json';
+          if (statSync(path).size === 0) {
+            throw new Error('CycloneDX SBOM is empty');
+          }
+
+          const sbom = JSON.parse(readFileSync(path, 'utf8'));
+          if (sbom.bomFormat !== 'CycloneDX' || !Array.isArray(sbom.components) || sbom.components.length === 0) {
+            throw new Error('SBOM is not a valid CycloneDX document with components');
+          }
+          if (sbom.components.some(({ name, version }) => !name || !version)) {
+            throw new Error('Every SBOM component must include a name and version');
+          }
+          console.log(`Validated CycloneDX SBOM with ${sbom.components.length} components.`);
+          NODE
+
+      - name: Upload CycloneDX SBOM
+        uses: actions/upload-artifact@v6
+        with:
+          name: npm-cyclonedx-sbom
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
   build:
     name: Build
-    needs: [dependency-audit, secret-scan]
+    needs: [dependency-audit, secret-scan, codeql-sast, generate-sbom]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -101,11 +168,9 @@ jobs:
 
   deploy:
     name: Deploy
-    needs: [tests, dependency-audit, secret-scan]
+    needs: [tests, dependency-audit, secret-scan, codeql-sast, generate-sbom]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    outputs:
-      vercel_url: ${{ steps.deploy-vercel.outputs.vercel_url }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -115,22 +180,57 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Validate production URL
+        env:
+          VERCEL_PRODUCTION_URL: ${{ vars.VERCEL_PRODUCTION_URL }}
+        run: |
+          node --input-type=module <<'NODE'
+          const rawUrl = process.env.VERCEL_PRODUCTION_URL;
+          if (!rawUrl) {
+            console.error('::error::Repository variable VERCEL_PRODUCTION_URL is missing.');
+            process.exit(1);
+          }
+
+          let productionUrl;
+          try {
+            productionUrl = new URL(rawUrl);
+          } catch {
+            console.error('::error::VERCEL_PRODUCTION_URL must be a valid HTTPS URL.');
+            process.exit(1);
+          }
+
+          if (
+            productionUrl.protocol !== 'https:' ||
+            productionUrl.hostname !== 'labs15c-one.vercel.app' ||
+            productionUrl.port ||
+            productionUrl.username ||
+            productionUrl.password ||
+            (productionUrl.pathname !== '/' && productionUrl.pathname !== '') ||
+            productionUrl.search ||
+            productionUrl.hash
+          ) {
+            console.error('::error::VERCEL_PRODUCTION_URL must be the canonical project URL https://labs15c-one.vercel.app/.');
+            process.exit(1);
+          }
+
+          console.log('VERCEL_PRODUCTION_URL is configured for the canonical labs15c production domain.');
+          NODE
+
       - name: Deploy to Vercel
         id: deploy-vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "$VERCEL_TOKEN" ]; then
-            echo "Error: falta el secreto VERCEL_TOKEN"
+          if [[ -z "$VERCEL_TOKEN" ]]; then
+            echo "::error::Repository secret VERCEL_TOKEN is missing."
             exit 1
           fi
-          URL="$(npx --yes vercel@latest deploy --prod --yes --token "$VERCEL_TOKEN" | tail -n 1)"
-          if [[ "$URL" != https://* ]]; then
-            echo "Error: Vercel no devolvió una URL válida: $URL"
-            exit 1
-          fi
-          echo "vercel_url=$URL" >> "$GITHUB_OUTPUT"
+          npx --yes vercel@latest deploy \
+            --prod \
+            --yes \
+            --token "$VERCEL_TOKEN" \
+            --build-env "VITE_DEPLOYMENT_SHA=$GITHUB_SHA"
 
   cypress-e2e:
     name: Cypress E2E Tests
@@ -149,17 +249,81 @@ jobs:
           node-version: '24'
 
       - name: Install Cypress dependencies
-        run: npm install cypress --save-dev
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
 
-      - name: Debug deployment URL
+      - name: Wait for the deployed production version
         env:
-          APP_URL: ${{ needs.deploy.outputs.vercel_url }}
-        run: echo "La URL recibida de Vercel es $APP_URL"
+          VERCEL_PRODUCTION_URL: ${{ vars.VERCEL_PRODUCTION_URL }}
+          EXPECTED_DEPLOYMENT_SHA: ${{ github.sha }}
+        run: |
+          node --input-type=module <<'NODE'
+          const rawUrl = process.env.VERCEL_PRODUCTION_URL;
+          const expectedSha = process.env.EXPECTED_DEPLOYMENT_SHA;
+          const targetUrl = new URL(rawUrl);
+          const deadline = Date.now() + 5 * 60 * 1000;
+          let lastProblem = 'the application has not responded yet';
+
+          while (Date.now() < deadline) {
+            try {
+              const response = await fetch(targetUrl, {
+                redirect: 'manual',
+                headers: { 'cache-control': 'no-cache' },
+                signal: AbortSignal.timeout(15000)
+              });
+
+              if (response.status >= 300 && response.status < 400) {
+                const location = response.headers.get('location') ?? '';
+                if (location.includes('vercel.com/login')) {
+                  throw new Error('the production domain is protected by Vercel Authentication');
+                }
+                lastProblem = `received HTTP ${response.status}`;
+              } else if (response.status === 401 || response.status === 403) {
+                throw new Error(`the production domain denied access with HTTP ${response.status}`);
+              } else if (response.status !== 200) {
+                lastProblem = `received HTTP ${response.status}`;
+              } else {
+                const html = await response.text();
+                if (/vercel\.com\/login|<title>\s*Login\s*[–-]\s*Vercel/i.test(html)) {
+                  throw new Error('the production domain is protected by Vercel Authentication');
+                }
+                const sha = html.match(/<meta[^>]+name=["']deployment-sha["'][^>]+content=["']([^"']+)["']/i)?.[1];
+                const isReactApp =
+                  /<title>\s*Registro de Productos\s*<\/title>/i.test(html) &&
+                  /id=["']root["']/.test(html) &&
+                  /\/assets\/[^"']+\.js/.test(html);
+
+                if (sha === expectedSha && isReactApp) {
+                  console.log('The canonical production domain serves the React build for this workflow commit.');
+                  process.exit(0);
+                }
+                lastProblem = !isReactApp
+                  ? 'the response is not the Vite React application'
+                  : 'the deployed build SHA does not match this workflow commit';
+              }
+            } catch (error) {
+              if (error.message.includes('protected by Vercel Authentication') || error.message.includes('denied access')) {
+                console.error(`::error::Production URL check failed: ${error.message}. Use the public production alias or configure Vercel Protection Bypass for Automation.`);
+                process.exit(1);
+              }
+              lastProblem = error.message;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          }
+
+          console.error(`::error::Production URL did not become the expected React deployment within five minutes: ${lastProblem}.`);
+          process.exit(1);
+          NODE
 
       - name: Run Cypress Tests
         uses: cypress-io/github-action@v7
         env:
-          CYPRESS_BASE_URL: ${{ needs.deploy.outputs.vercel_url }}
+          CYPRESS_BASE_URL: ${{ vars.VERCEL_PRODUCTION_URL }}
           CYPRESS_SCREENSHOT_ON_RUN_FAILURE: 'true'
           CYPRESS_VIDEO: 'false'
         with:
@@ -167,3 +331,12 @@ jobs:
           browser: chrome
           record: false
           publish-summary: true
+
+      - name: Upload Cypress screenshots
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cypress-screenshots
+          path: cypress/screenshots
+          if-no-files-found: warn
+          retention-days: 30
